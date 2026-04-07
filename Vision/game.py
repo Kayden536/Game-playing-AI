@@ -9,7 +9,7 @@ from PIL import ImageGrab, ImageEnhance, Image
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.05
 
-
+ 
 # ============================================================
 #  VISION — simplified and faster
 # ============================================================
@@ -52,9 +52,15 @@ Reply with ONLY this short JSON:
     "player_y": 0-100,
     "nearest_obstacle_x": 0-100,
     "gap_y": 0-100,
-    "action_needed": "what to do right now in 5 words max"
+    "action": "press_key or click or wait",
+    "key": "space",
+    "x_percent": 50,
+    "y_percent": 50,
+    "reason": "why in 5 words max"
 }}
 
+IMPORTANT: x_percent and y_percent are 0-100 representing position on screen.
+If game_over and you see a retry/play button, find its location and set action=click with coordinates.
 JSON only. No other text."""
 
         try:
@@ -67,7 +73,7 @@ JSON only. No other text."""
                 }],
                 options={
                     "temperature": 0.1,
-                    "num_predict": 200,  # SHORT response
+                    "num_predict": 250,  # SHORT response
                 },
             )
 
@@ -210,11 +216,17 @@ class Actions:
 
         try:
             if action == "click":
-                x, y = self.percent_to_screen(
-                    action_data.get("x", action_data.get("x_percent", 50)),
-                    action_data.get("y", action_data.get("y_percent", 50)),
-                )
-                print(f"     clicking ({x}, {y})")
+                # Check if absolute coordinates provided
+                if "x_abs" in action_data and "y_abs" in action_data:
+                    x, y = action_data["x_abs"], action_data["y_abs"]
+                    print(f"     clicking absolute ({x}, {y})")
+                else:
+                    # Use percentage-based coordinates
+                    x, y = self.percent_to_screen(
+                        action_data.get("x_percent", action_data.get("x", 50)),
+                        action_data.get("y_percent", action_data.get("y", 50)),
+                    )
+                    print(f"     clicking percent->screen ({x}, {y})")
                 pyautogui.click(x, y)
 
             elif action == "press_key":
@@ -250,20 +262,31 @@ class Actions:
 
 class GameAI:
     def __init__(self, vision_model="gemma3", brain_model="mistral",
-                 game_region=None):
+                 game_region=None, vision_only=True, retry_button=None):
         print("=" * 40)
         print("  🎮 AI Game Player (Fast)")
         print("=" * 40)
 
         self.vision = Vision(model=vision_model)
-        self.brain = Brain(model=brain_model)
+        self.vision_only = vision_only
+        self.brain = None if vision_only else Brain(model=brain_model)
         self.actions = Actions()
+        self.retry_button = retry_button  # (x, y) absolute coords
 
         if game_region:
             self.actions.set_game_region(*game_region)
 
         self.game_rules = ""
         self.loop_count = 0
+        self.last_state = None
+        
+        if vision_only:
+            print("⚡ FAST MODE: Vision-only (no separate brain)")
+        else:
+            print("🐌 SLOW MODE: Vision + Brain")
+        
+        if retry_button:
+            print(f"🔘 Retry button override: {retry_button}")
 
     def set_game_rules(self, rules):
         self.game_rules = rules
@@ -280,14 +303,27 @@ class GameAI:
         )
         print(f"👁️  Vision: {time.time() - t0:.1f}s")
 
-        # THINK
-        t0 = time.time()
-        action = self.brain.decide(game_state, self.game_rules)
-        print(f"🧠 Brain: {time.time() - t0:.1f}s")
+        # THINK (optional)
+        if self.vision_only:
+            # Use action from vision directly
+            action = game_state if game_state else {"action": "wait"}
+            
+            # Override retry button if specified and game is over
+            if self.retry_button and game_state and game_state.get("state") == "game_over":
+                action["action"] = "click"
+                action["x_abs"] = self.retry_button[0]
+                action["y_abs"] = self.retry_button[1]
+                action["reason"] = "retry button override"
+                print(f"🔘 Using retry button override: {self.retry_button}")
+        else:
+            t0 = time.time()
+            action = self.brain.decide(game_state, self.game_rules)
+            print(f"🧠 Brain: {time.time() - t0:.1f}s")
 
         # ACT
         self.actions.execute(action)
-
+        
+        self.last_state = game_state
         return game_state, action
 
     def run(self, max_loops=None, delay=0.5):
@@ -319,7 +355,7 @@ class GameAI:
 # ============================================================
 
 PRESETS = {
-    "flappy_bird": "click to flap. Avoid pipes. If bird is low, click. If bird is high, wait. If Game Over click X=800 and Y=215",
+    "flappy_bird": "Flappy Bird: During gameplay, use press_key with key='space' to flap upward. If bird too low or near obstacle, press space. If bird too high, wait. When you see Game Over screen, look for the retry/restart button and click it. The button is typically in the center-upper area of the game window.",
     "cookie_clicker": "Click the big cookie. Buy cheapest upgrade when possible.",
     "dino_run": "Press SPACE to jump over cacti. Press DOWN to duck under birds.",
     "2048": "Use arrow keys. Keep highest tile in corner.",
@@ -347,9 +383,15 @@ def main():
     else:
         rules = input("Game rules: ").strip()
 
-    v_model = input("Vision model [gemma3]: ").strip() or "gemma3"
-    b_model = input("Brain model [mistral]: ").strip() or "mistral"
-    delay = float(input("Loop delay seconds [0.5]: ").strip() or "0.5")
+    v_model = input("Vision model [minicpm-v]: ").strip() or "minicpm-v"
+    
+    use_brain = input("Use separate brain model? (y/n) [n]: ").strip().lower() == "y"
+    b_model = "mistral"
+    vision_only = not use_brain
+    if use_brain:
+        b_model = input("Brain model [mistral]: ").strip() or "mistral"
+    
+    delay = float(input("Loop delay seconds [0.3]: ").strip() or "0.3")
     max_l = input("Max loops [empty=unlimited]: ").strip()
     max_loops = int(max_l) if max_l else None
 
@@ -360,8 +402,18 @@ def main():
             region = tuple(int(p) for p in region_input.split(","))
         except ValueError:
             pass
+    
+    # Retry button override for game over
+    retry_input = input("Retry button x,y [empty=auto or 800,215 for flappy]: ").strip()
+    retry_button = None
+    if retry_input:
+        try:
+            retry_button = tuple(int(p) for p in retry_input.split(","))
+        except ValueError:
+            pass
 
-    ai = GameAI(vision_model=v_model, brain_model=b_model, game_region=region)
+    ai = GameAI(vision_model=v_model, brain_model=b_model, game_region=region, 
+                vision_only=vision_only, retry_button=retry_button)
     ai.set_game_rules(rules)
 
     mode = input("(r)un or (s)tep? [r]: ").strip().lower()
